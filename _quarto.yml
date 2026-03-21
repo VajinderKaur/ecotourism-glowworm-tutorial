@@ -1,0 +1,9 @@
+project:
+  type: default
+render:
+  - "easy-task/*.qmd"
+
+execute:
+  echo: true
+warning: false
+message: false
