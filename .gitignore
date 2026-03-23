@@ -4,3 +4,8 @@
 __pycache__/
 .DS_Store
 .quarto/
+/.quarto/
+**/*.quarto_ipynb
+hard-task/rsconnect
+easy-task/rsconnect
+medium-task/app/rsconnect

@@ -1,0 +1,597 @@
+---
+title: "Predicting the Best Times to Spot Wildlife"
+subtitle: "A confidence-weighted scoring function for the ecotourism package"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: show
+    code-tools: true
+    theme: flatly
+    self-contained: true
+execute:
+  warning: false
+  message: false
+editor: 
+  markdown: 
+    wrap: 72
+---
+
+## The question
+
+The hard task asked for a function that takes occurrence and weather
+data and predicts the top five days and times to spot an organism.
+
+The first question is what *predict* means here. The package contains no
+future weather forecasts. What it contains is ten years of sighting
+records with timestamps, the weather conditions on those days, and a set
+of top weather stations matched to each organism. The approach taken
+here is:
+
+> Find the month × hour combinations that have historically produced the
+> most sightings, weight those combinations by how much weather
+> conditions on sighting days differed from the baseline, and report
+> each recommendation alongside an honest confidence score that reflects
+> how much data backs it up.
+
+This is the prediction — if these seasonal and weather conditions
+repeat, this is when you are most likely to see the organism.
+
+------------------------------------------------------------------------
+
+## Setup
+
+```{r}
+#| label: setup
+
+library(ecotourism)
+library(dplyr)
+library(tidyr)
+library(lubridate)
+
+data("glowworms")
+data("gouldian_finch")
+data("manta_rays")
+data("orchids")
+data("weather")
+data("top_stations")
+```
+
+------------------------------------------------------------------------
+
+## Understanding the data
+
+Before writing the function, three things needed to be established from
+the data.
+
+### Record types and the midnight artifact
+
+Inspecting `record_type` across all four organisms revealed an important
+data quality issue:
+
+```{r}
+#| label: record-types
+
+# Record types per organism
+lapply(
+  list(glowworms = glowworms, gouldian_finch = gouldian_finch,
+       manta_rays = manta_rays, orchids = orchids),
+  function(df) table(df$record_type)
+)
+```
+
+Manta rays stand out immediately — 675 of 953 records are
+`MACHINE_OBSERVATION`. The following confirms these are not real
+behavioural sightings:
+
+```{r}
+#| label: machine-obs-evidence
+
+manta_rays %>%
+  group_by(record_type) %>%
+  summarise(
+    n           = n(),
+    pct_hour_0  = round(mean(hour == 0) * 100, 1),
+    median_hour = median(hour)
+  )
+```
+
+**100% of `MACHINE_OBSERVATION` records are recorded at hour 0.** This
+is not manta ray behaviour — it is the default timestamp written by
+acoustic tags and satellite trackers when no exact time is available.
+These records are excluded from all time-of-day analysis in the
+function.
+
+### The join strategy
+
+The occurrence datasets each contain a `ws_id` column — the nearest
+weather station to each sighting. Rather than joining directly on
+`ws_id` and `date` (which produces few matches because occurrence
+stations often differ from weather stations), the `top_stations` table
+is used as a bridge. It maps each organism to its two or three most
+relevant weather stations, giving much better weather coverage.
+
+Where multiple stations cover the same date, weather variables are
+averaged across stations before joining. This also resolves the
+many-to-many join warning that arises when a single sighting date
+matches multiple station records.
+
+### Hour distributions and ecological plausibility
+
+The hour distribution for each organism reveals its activity pattern:
+
+```{r}
+#| label: hour-distributions
+
+cat("--- Glowworms ---\n");      table(glowworms$hour)
+cat("\n--- Gouldian Finch ---\n"); table(gouldian_finch$hour)
+cat("\n--- Manta Rays (human only) ---\n")
+manta_rays %>%
+  filter(record_type == "HUMAN_OBSERVATION") %>%
+  pull(hour) %>% table()
+cat("\n--- Orchids ---\n");        table(orchids$hour)
+```
+
+Rather than hardcoding an activity window per organism, the function
+derives the plausible hour range directly from the data — the central
+80% of sightings (10th to 90th percentile of the hour distribution). A
+cosine taper is applied outside this window so there is no hard cliff at
+the boundary.
+
+### Data sparsity
+
+How sparse is the month × hour grid for each organism?
+
+```{r}
+#| label: sparsity
+
+organisms <- list(
+  glowworms      = glowworms,
+  gouldian_finch = gouldian_finch,
+  manta_rays     = manta_rays,
+  orchids        = orchids
+)
+
+for (name in names(organisms)) {
+  cat("\n---", name, "---\n")
+  organisms[[name]] %>%
+    filter(hour != 0, record_type != "MACHINE_OBSERVATION") %>%
+    count(month, hour) %>%
+    summarise(
+      total_cells      = n(),
+      median_n         = median(n),
+      cells_with_1     = sum(n == 1),
+      cells_with_5plus = sum(n >= 5)
+    ) %>% print()
+}
+```
+
+Glowworms and manta rays are very sparse — most month × hour cells
+contain only a single sighting. Orchids and gouldian finch are dense. A
+naive frequency ranking treats a cell with 1 sighting the same as one
+with 50. The confidence score addresses this directly.
+
+------------------------------------------------------------------------
+
+## The function
+
+The function combines three components into a final score for every
+month × hour combination:
+
+**Composite score** — weighted average of month frequency (40%), hour
+frequency (40%), and weather favourability (20%). Weather weight is
+self-calibrating: variables are weighted by Cohen's d, the standardised
+difference between sighting-day conditions and baseline. If weather
+barely differs on sighting days, it contributes almost nothing to the
+score.
+
+**Confidence score** — exponential saturation curve `1 - exp(-n / k)`,
+where `n` is the number of sightings in that month × hour cell and
+`k = 5` by default. This is borrowed from reliability engineering. It is
+honest about sparse data: 1 sighting scores 0.18, 5 sightings scores
+0.63, 10 scores 0.86, 20+ approaches 0.98 but never reaches 1.0.
+
+**Ecological plausibility score** — derived from the data, not
+hardcoded. The central 80% of the hour distribution defines the
+plausible window. Hours inside score 1.0; hours outside decay smoothly
+via a cosine taper to a floor of 0.2.
+
+**Final score** = `composite × (0.6 × confidence + 0.4 × plausibility)`
+
+This means:
+
+-   High confidence + plausible hour → high score, recommended strongly
+-   Low confidence + plausible hour → moderate score, flagged as sparse
+    but biologically consistent
+-   High confidence + implausible hour → penalised, flagged as caution
+-   Low confidence + implausible hour → penalised hard
+
+```{r}
+#| label: function-definition
+
+predict_best_spotting_times <- function(occurrence_data,
+                                        weather_data,
+                                        top_stations,
+                                        organism_name,
+                                        n      = 5,
+                                        conf_k = 5) {
+
+  # ── 1. Remove machine observations ────────────────────────────────────────
+  # Evidence: 100% of MACHINE_OBSERVATION records have hour = 0
+  # These are acoustic/satellite tags defaulting to midnight, not sightings
+  n_total   <- nrow(occurrence_data)
+  n_machine <- sum(occurrence_data$record_type == "MACHINE_OBSERVATION",
+                   na.rm = TRUE)
+
+  occ <- occurrence_data %>%
+    filter(record_type != "MACHINE_OBSERVATION")
+
+  if (n_machine > 0) {
+    message("Excluded ", n_machine, "/", n_total,
+            " MACHINE_OBSERVATION records (all recorded at hour 0 by default)")
+  }
+
+  # ── 2. Remove hour = 0 ────────────────────────────────────────────────────
+  # Hour 0 in human observations also likely reflects missing time data,
+  # not genuine midnight sightings
+  n_zero <- sum(occ$hour == 0, na.rm = TRUE)
+  occ    <- occ %>% filter(!is.na(hour), hour != 0)
+
+  if (n_zero > 0) {
+    message("Excluded ", n_zero,
+            " records with hour = 0 (likely missing time, not genuine midnight sightings)")
+  }
+
+  # ── 3. Derive ecological plausibility window from the data ─────────────────
+  # Central 80% of sightings defines the plausible hour range
+  # No hardcoding — works for any organism
+  hour_dist <- occ %>%
+    count(hour) %>%
+    arrange(hour) %>%
+    mutate(cum_pct = cumsum(n) / sum(n))
+
+  plausible_hours <- hour_dist %>%
+    filter(cum_pct >= 0.10, cum_pct <= 0.90) %>%
+    pull(hour)
+
+  plaus_min <- min(plausible_hours)
+  plaus_max <- max(plausible_hours)
+
+  message("Ecological plausibility window (central 80% of sightings): ",
+          sprintf("%02d:00", plaus_min), " - ", sprintf("%02d:00", plaus_max))
+
+  # Cosine taper outside plausibility window — no hard cliff at boundary
+  plausibility_score <- function(h) {
+    dist <- pmax(0, pmax(plaus_min - h, h - plaus_max))
+    ifelse(h >= plaus_min & h <= plaus_max,
+           1.0,
+           pmax(0.2, cos(dist / 3 * pi / 2)))
+  }
+
+  # ── 4. Get weather for top stations, averaged per date ─────────────────────
+  org_stations <- top_stations %>%
+    filter(organism == organism_name)
+
+  if (nrow(org_stations) == 0) {
+    stop("No top stations found for organism: ", organism_name)
+  }
+
+  weather_org <- weather_data %>%
+    filter(ws_id %in% org_stations$ws_id) %>%
+    group_by(date, month, dayofyear) %>%
+    summarise(
+      temp       = mean(temp,       na.rm = TRUE),
+      rh         = mean(rh,         na.rm = TRUE),
+      prcp       = mean(prcp,       na.rm = TRUE),
+      rainy      = mean(rainy,      na.rm = TRUE),
+      wind_speed = mean(wind_speed, na.rm = TRUE),
+      .groups    = "drop"
+    ) %>%
+    # mean(na.rm = TRUE) on all-NA groups produces NaN — convert to NA
+    mutate(across(where(is.numeric), ~ifelse(is.nan(.x), NA, .x)))
+
+  # ── 5. Join occurrences to weather ────────────────────────────────────────
+  occ_weather <- occ %>%
+    select(date, hour, month, weekday, dayofyear) %>%
+    inner_join(weather_org, by = "date")
+
+  # ── 6. Self-calibrating weather weights via Cohen's d ─────────────────────
+  # Cohen's d measures how much each weather variable differs between
+  # sighting days and all days. Variables that differ more get more weight.
+  cohen_d <- function(x_obs, x_all) {
+    x_obs <- x_obs[!is.na(x_obs)]
+    x_all <- x_all[!is.na(x_all)]
+    if (length(x_obs) < 3 || length(x_all) < 3) return(0)
+    s <- sd(x_all)
+    if (is.na(s) || s == 0) return(0)
+    abs(mean(x_obs) - mean(x_all)) / s
+  }
+
+  d_temp  <- cohen_d(occ_weather$temp,       weather_org$temp)
+  d_rain  <- cohen_d(occ_weather$rainy,      weather_org$rainy)
+  d_wind  <- cohen_d(occ_weather$wind_speed, weather_org$wind_speed)
+  d_rh    <- cohen_d(occ_weather$rh,         weather_org$rh)
+  total_d <- d_temp + d_rain + d_wind + d_rh + 1e-6
+
+  ideal_temp  <- mean(occ_weather$temp,       na.rm = TRUE)
+  ideal_rain  <- mean(occ_weather$rainy,      na.rm = TRUE)
+  ideal_wind  <- mean(occ_weather$wind_speed, na.rm = TRUE)
+  ideal_rh    <- mean(occ_weather$rh,         na.rm = TRUE)
+
+  # Score each historical weather day by closeness to ideal conditions
+  weather_scored <- weather_org %>%
+    mutate(
+      weather_score = 1 - (
+        (d_temp / total_d) * pmin(abs(temp       - ideal_temp) / 10,  1) +
+        (d_rain / total_d) * pmin(abs(rainy       - ideal_rain),       1) +
+        (d_wind / total_d) * pmin(abs(wind_speed  - ideal_wind) / 10,  1) +
+        (d_rh   / total_d) * pmin(abs(rh          - ideal_rh)   / 100, 1)
+      ),
+      weather_score = ifelse(is.na(weather_score), 0.5, weather_score)
+    ) %>%
+    select(date, month, weather_score)
+
+  monthly_weather <- weather_scored %>%
+    group_by(month) %>%
+    summarise(avg_weather_score = mean(weather_score, na.rm = TRUE),
+              .groups = "drop")
+
+  # ── 7. Frequency scores ────────────────────────────────────────────────────
+  month_scores <- occ %>%
+    count(month, name = "n_month") %>%
+    mutate(month_score = n_month / sum(n_month))
+
+  hour_scores <- occ %>%
+    count(hour, name = "n_hour") %>%
+    mutate(hour_score = n_hour / sum(n_hour))
+
+  # ── 8. Confidence: sightings per month x hour cell ────────────────────────
+  month_hour_counts <- occ %>%
+    count(month, hour, name = "n_cell")
+
+  # ── 9. Build month x hour grid and score every combination ────────────────
+  grid <- merge(data.frame(month = 1:12), data.frame(hour = 1:23))
+
+  results <- grid %>%
+    left_join(month_scores,      by = "month") %>%
+    left_join(monthly_weather,   by = "month") %>%
+    left_join(hour_scores,       by = "hour")  %>%
+    left_join(month_hour_counts, by = c("month", "hour")) %>%
+    replace_na(list(
+      month_score       = 0,
+      avg_weather_score = 0.5,
+      hour_score        = 0,
+      n_cell            = 0
+    )) %>%
+    mutate(
+      # Base composite score
+      composite_score = 0.40 * month_score +
+                        0.40 * hour_score  +
+                        0.20 * avg_weather_score,
+
+      # Confidence: exponential saturation curve
+      # 1 sighting = 0.18, 5 = 0.63, 10 = 0.86, 20+ approaches 0.98
+      confidence   = 1 - exp(-n_cell / conf_k),
+
+      # Ecological plausibility: data-derived window with cosine taper
+      plausibility = plausibility_score(hour),
+
+      # Final score: composite scaled by confidence-plausibility blend
+      # Multiplicative so low confidence AND low plausibility compounds penalty
+      # But low confidence WITH high plausibility still surfaces the result
+      confidence_weight = 0.6 * confidence + 0.4 * plausibility,
+      final_score       = composite_score * confidence_weight,
+
+      # Labels
+      month_name   = month.name[month],
+      time_label   = sprintf("%02d:00", hour),
+      period       = case_when(
+        hour < 12 ~ "Morning",
+        hour < 17 ~ "Afternoon",
+        TRUE      ~ "Evening/Night"
+      ),
+
+      # Plain-English confidence interpretation
+      confidence_tag = case_when(
+        confidence >= 0.63 & plausibility >= 0.8 ~
+          "High — strong data, ecologically expected",
+        confidence >= 0.18 & plausibility >= 0.8 ~
+          "Moderate — sparse data but ecologically plausible",
+        confidence >= 0.63 & plausibility <  0.8 ~
+          "Caution — data present but unusual time",
+        TRUE ~
+          "Low — sparse data and atypical time"
+      )
+    ) %>%
+    arrange(desc(final_score))
+
+  top_results <- results %>% slice_head(n = n)
+
+  # ── 10. Print results ──────────────────────────────────────────────────────
+  cat("\n")
+  cat("  Best times to spot:", organism_name, "\n")
+  cat(rep("-", 60), "\n", sep = "")
+  cat(sprintf("  %-22s  %-6s  %-6s  %-6s  %s\n",
+              "When", "Score", "Conf.", "Plaus.", "Tag"))
+  cat(rep("-", 60), "\n", sep = "")
+
+  for (i in seq_len(nrow(top_results))) {
+    row <- top_results[i, ]
+    cat(sprintf("  %d. %-10s %s  %.3f  %.2f    %.2f    %s\n",
+                i,
+                row$month_name,
+                row$time_label,
+                row$final_score,
+                row$confidence,
+                row$plausibility,
+                row$confidence_tag))
+  }
+
+  cat("\n")
+  cat("  Plausibility window:",
+      sprintf("%02d:00", plaus_min), "-", sprintf("%02d:00", plaus_max), "\n")
+  cat("  Cohen's d — temp:", round(d_temp, 3),
+      "| rain:", round(d_rain, 3),
+      "| wind:", round(d_wind, 3),
+      "| rh:", round(d_rh, 3), "\n")
+  cat("  Confidence k =", conf_k,
+      "(1 sighting = 0.18, 5 = 0.63, 10 = 0.86, 20+ ~ 0.98)\n")
+
+  invisible(list(
+    recommendations     = top_results,
+    full_grid           = results,
+    plausibility_window = c(plaus_min, plaus_max),
+    cohen_d = c(temp = d_temp, rain = d_rain, wind = d_wind, rh = d_rh)
+  ))
+}
+```
+
+------------------------------------------------------------------------
+
+## Results
+
+### Glowworms
+
+```{r}
+#| label: results-glowworms
+
+results_glow <- predict_best_spotting_times(
+  glowworms, weather, top_stations, "glowworms"
+)
+```
+
+December dominates, which reflects the combined signal from all three
+states. Notably, December 15:00 ranks first — initially surprising for a
+bioluminescent organism. Investigation of the state-level data reveals
+why:
+
+```{r}
+#| label: glowworm-state-hour
+
+glowworms %>%
+  filter(month == 12, hour != 0) %>%
+  mutate(
+    time_type = case_when(
+      hour >= 20 | hour <= 4 ~ "Night",
+      hour >= 17             ~ "Evening",
+      TRUE                   ~ "Daytime"
+    )
+  ) %>%
+  count(obs_state, time_type) %>%
+  arrange(obs_state, time_type)
+```
+
+Tasmania accounts for the majority of December sightings, and 19 of
+those are daytime — almost certainly organised cave and tunnel tours
+where artificial darkness makes glowworms visible regardless of the time
+outside. Queensland sightings, by contrast, cluster after 18:00 in line
+with natural bioluminescence behaviour.
+
+The confidence scoring system surfaced this result rather than
+suppressing it. A simple frequency ranking would have ranked December
+22:00 first and moved on. The high confidence score at 15:00 prompted
+the investigation that revealed two genuinely different spotting
+contexts within one organism dataset — cave tourism in Tasmania and wild
+sightings in Queensland.
+
+The plausibility window of 09:00–21:00 is broader than expected for a
+nocturnal organism precisely because it is data-derived and both
+contexts are present in the data.
+
+### Gouldian Finch
+
+```{r}
+#| label: results-finch
+
+results_finch <- predict_best_spotting_times(
+  gouldian_finch, weather, top_stations, "gouldian_finch"
+)
+```
+
+All five top recommendations are at 07:00 across the dry season months
+(May–September). Confidence is 1.00 across the board — this is the most
+data-rich dataset with a median of 8 sightings per month × hour cell.
+The dawn chorus signal is unambiguous and the weather effect sizes
+(Cohen's d for temp = 0.40, rh = 0.38) confirm that dry season
+conditions are meaningfully associated with sightings.
+
+### Manta Rays
+
+```{r}
+#| label: results-manta
+
+results_manta <- predict_best_spotting_times(
+  manta_rays, weather, top_stations, "manta_rays"
+)
+```
+
+The function automatically excludes 675 machine observation records
+before any analysis. After exclusion, June emerges as the peak month
+with mid-morning hours (08:00–11:00) scoring highest — consistent with
+divers and snorkellers operating during daylight in winter feeding
+aggregations.
+
+June 22:00 appears at rank 4 with a "Caution" flag (confidence 0.97 but
+plausibility 0.50). This is the system working correctly: there are real
+human sightings recorded at 22:00 in June, but the hour sits outside the
+central 80% of the distribution. The recommendation surfaces with a
+clear warning rather than being silently suppressed or silently
+promoted.
+
+The temperature Cohen's d of 0.58 is the highest of any organism —
+weather is a genuine predictor for manta rays, reflecting their
+sensitivity to water temperature during feeding season.
+
+### Orchids
+
+```{r}
+#| label: results-orchids
+
+results_orchid <- predict_best_spotting_times(
+  orchids, weather, top_stations, "orchids"
+)
+```
+
+September dominates with all five slots falling between 10:00 and 14:00
+— Australian spring bloom, mid-morning when pollinators are most active.
+Confidence is 1.00 throughout; orchids have a median of 20.5 sightings
+per month × hour cell, making this the most statistically robust set of
+recommendations. Wind and humidity Cohen's d values are both 0,
+confirming that for orchids, season and time of day carry the prediction
+entirely — weather conditions on the day matter very little.
+
+------------------------------------------------------------------------
+
+## What makes this approach different
+
+Three things distinguish this function from simpler approaches.
+
+**Confidence scoring.** A recommendation based on 1 sighting looks
+identical to one based on 50 in a frequency table. The exponential
+saturation curve `1 - exp(-n/k)` makes this visible. The curve shape is
+borrowed from reliability engineering — confidence builds quickly at
+first then plateaus, which is the right behaviour for count data. The k
+parameter is tunable: a smaller k rewards sparse data more generously, a
+larger k is stricter.
+
+**Data-derived ecological plausibility.** Rather than hardcoding
+activity windows per organism, the function calculates the central 80%
+of the hour distribution and applies a cosine taper outside it. This
+works for any organism without prior knowledge. The cosine taper means
+there is no abrupt penalty at the boundary — an hour just outside the
+window still receives partial credit.
+
+**Multiplicative combination.** The three components — composite score,
+confidence, and plausibility — combine multiplicatively rather than
+additively. This means low confidence AND low plausibility compounds the
+penalty. But a low-confidence recommendation that is ecologically
+plausible still surfaces, labelled honestly as "Moderate — sparse data
+but ecologically plausible." The plain-English confidence tag means the
+output is immediately interpretable without reading the underlying
+numbers.
+
+The manta ray June 22:00 result and the glowworm December 15:00 result
+are both examples of the system behaving correctly — one surfaced with a
+caution flag, one surfaced with high confidence and prompted an
+investigation that revealed a genuine biological and ecological pattern
+in the data.
