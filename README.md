@@ -30,6 +30,8 @@ The tutorial emphasizes:
 
 **File:**
 - `ecotourism_tutorial.qmd`
+-  https://rpubs.com/VajinderKaur/ecotourism-joinlesson
+-  https://vajinderkaur.github.io/ecotourism-glowworm-tutorial/easy-task/ecotourism_tutorialsol.html
 
 ---
 
@@ -55,6 +57,7 @@ Help users visually explore where and when wildlife is observed.
 - `utils.R`
 - `text.R`
 - `styles.css`
+- https://okinawa.shinyapps.io/ecotourism_tour/
 
 ---
 
@@ -84,6 +87,7 @@ Balances data-driven patterns with biological realism.
 
 **File:**
 - `predict_best_spotting_times.R`
+- https://rpubs.com/VajinderKaur/predict-ecotourism
 
 ---
 
